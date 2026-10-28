@@ -1,0 +1,166 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+"""
+PrepPal AI - Flask Application
+Serves the web interface and handles REST API requests for interview sessions,
+answer evaluations, and performance analytics.
+"""
+
+import os
+import uuid
+import json
+import datetime
+from flask import Flask, render_template, request, jsonify, redirect, url_for
+from interview_engine import InterviewEngine
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "preppal-ai-secret-key-2026")
+
+SESSIONS = {}
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "data", "interview_history.json")
+
+engine = InterviewEngine()
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_history(entry):
+    history = load_history()
+    history.insert(0, entry)
+    history = history[:50]  # Store last 50 sessions
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"Error saving history: {e}")
+
+# --- HTML ROUTES ---
+@app.route("/")
+def index():
+    roles = engine.get_available_roles()
+    return render_template("index.html", roles=roles)
+
+@app.route("/interview/<session_id>")
+def interview_page(session_id):
+    session = SESSIONS.get(session_id)
+    if not session:
+        return redirect(url_for("index"))
+    return render_template("interview.html", session=session)
+
+@app.route("/report/<session_id>")
+def report_page(session_id):
+    session = SESSIONS.get(session_id)
+    if not session or not session.get("completed"):
+        for h in load_history():
+            if h.get("session_id") == session_id:
+                return render_template("report.html", session=h)
+        return redirect(url_for("index"))
+    return render_template("report.html", session=session)
+
+@app.route("/history")
+def history_page():
+    return render_template("history.html", history=load_history())
+
+@app.route("/viva")
+def viva_page():
+    return render_template("viva.html")
+
+# --- REST API ENDPOINTS ---
+@app.route("/api/start-session", methods=["POST"])
+def api_start_session():
+    data = request.get_json() or {}
+    role_id = data.get("role_id", "software_engineer")
+    custom_role = data.get("custom_role", "").strip()
+    level = data.get("level", "Fresher / Student")
+    question_count = int(data.get("question_count", 4))
+    candidate_name = data.get("candidate_name", "Student Candidate").strip() or "Student Candidate"
+
+    questions = engine.get_questions_for_role(role_id, level, question_count, custom_role)
+
+    role_title = custom_role if role_id == "custom" and custom_role else "Software Engineer / SDE"
+    for r in engine.get_available_roles():
+        if r["id"] == role_id and role_id != "custom":
+            role_title = r["name"]
+
+    session_id = str(uuid.uuid4())
+    session_data = {
+        "session_id": session_id,
+        "candidate_name": candidate_name,
+        "role_id": role_id,
+        "role_title": role_title,
+        "level": level,
+        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "total_questions": len(questions),
+        "questions": questions,
+        "evaluations": [],
+        "completed": False
+    }
+
+    SESSIONS[session_id] = session_data
+    return jsonify({"success": True, "session_id": session_id, "total_questions": len(questions)})
+
+@app.route("/api/session/<session_id>", methods=["GET"])
+def api_get_session(session_id):
+    session = SESSIONS.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(session)
+
+@app.route("/api/evaluate-answer", methods=["POST"])
+def api_evaluate_answer():
+    data = request.get_json() or {}
+    session_id = data.get("session_id")
+    question_id = data.get("question_id")
+    user_answer = data.get("answer", "")
+    time_spent = data.get("time_spent_seconds", 0)
+
+    session = SESSIONS.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    question_obj = next((q for q in session["questions"] if q["id"] == question_id), None)
+    if not question_obj:
+        return jsonify({"error": "Question not found"}), 404
+
+    evaluation = engine.evaluate_answer(
+        question=question_obj["question"],
+        user_answer=user_answer,
+        category=question_obj.get("category", ""),
+        expected_keywords=question_obj.get("keywords", []),
+        model_answer=question_obj.get("model_answer", "")
+    )
+
+    eval_record = {
+        "question_id": question_id,
+        "question": question_obj["question"],
+        "category": question_obj.get("category", "General"),
+        "user_answer": user_answer,
+        "time_spent_seconds": time_spent,
+        "evaluation": evaluation
+    }
+
+    session["evaluations"] = [e for e in session["evaluations"] if e["question_id"] != question_id]
+    session["evaluations"].append(eval_record)
+
+    if len(session["evaluations"]) >= session["total_questions"]:
+        session["completed"] = True
+        assessment = engine.calculate_session_assessment([e["evaluation"] for e in session["evaluations"]])
+        session["assessment"] = assessment
+        save_history(session)
+
+    return jsonify({
+        "success": True,
+        "evaluation": evaluation,
+        "completed": session["completed"],
+        "answered_count": len(session["evaluations"]),
+        "total_questions": session["total_questions"]
+    })
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
